@@ -16,12 +16,12 @@ class Server {
   void handThisConn() { loop_->updatePoller(acceptChannel_); }
 
  private:
-  EventLoop *loop_;
-  int threadNum_;
-  std::unique_ptr<EventLoopThreadPool> eventLoopThreadPool_;
-  bool started_;
-  std::shared_ptr<Channel> acceptChannel_;
-  int port_;
-  int listenFd_;
+  EventLoop *loop_;//监听
+  int threadNum_;//线程数
+  std::unique_ptr<EventLoopThreadPool> eventLoopThreadPool_;//线程池指针
+  bool started_;//开始状态
+  std::shared_ptr<Channel> acceptChannel_;//管道指针
+  int port_;//端口号
+  int listenFd_;//
   static const int MAXFDS = 100000;
 };
