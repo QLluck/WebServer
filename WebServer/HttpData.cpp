@@ -1,24 +1,39 @@
-// @Author Lin Ya
-// @Email xxbbb@vip.qq.com
+/// @file HttpData.cpp
+/// @brief HTTP请求处理类实现文件
+/// @author Lin Ya
+/// @email xxbbb@vip.qq.com
+/// 
+/// @details 实现了HTTP请求的完整处理流程：
+/// - HTTP请求解析（URI、Headers、Body）
+/// - HTTP响应生成
+/// - 静态文件服务
+/// - Keep-Alive连接管理
+/// - 错误处理
+
 #include "HttpData.h"
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <iostream>
-#include "Channel.h"
-#include "EventLoop.h"
-#include "Util.h"
-#include "time.h"
+#include <fcntl.h>      ///< 文件控制（open等）
+#include <sys/mman.h>   ///< 内存映射（mmap）
+#include <sys/stat.h>    ///< 文件状态（stat）
+#include <iostream>     ///< 输入输出流
+#include "Channel.h"    ///< 事件通道类
+#include "EventLoop.h"  ///< 事件循环类
+#include "Util.h"       ///< 工具函数
+#include "time.h"       ///< 时间相关
 
 using namespace std;
 
+/// @brief MIME类型映射表的初始化控制器（确保只初始化一次）
 pthread_once_t MimeType::once_control = PTHREAD_ONCE_INIT;
+
+/// @brief MIME类型映射表（文件扩展名 -> MIME类型）
 std::unordered_map<std::string, std::string> MimeType::mime;
 
-const __uint32_t DEFAULT_EVENT = EPOLLIN | EPOLLET | EPOLLONESHOT;
-const int DEFAULT_EXPIRED_TIME = 2000;              // ms
-const int DEFAULT_KEEP_ALIVE_TIME = 5 * 60 * 1000;  // ms
+const __uint32_t DEFAULT_EVENT = EPOLLIN | EPOLLET | EPOLLONESHOT;  ///< 默认epoll事件类型
+const int DEFAULT_EXPIRED_TIME = 2000;              ///< 默认超时时间（毫秒）
+const int DEFAULT_KEEP_ALIVE_TIME = 5 * 60 * 1000;  ///< Keep-Alive连接超时时间（5分钟，毫秒）
 
+/// @brief favicon.ico文件的二进制数据（PNG格式，555字节）
+/// @details 当客户端请求favicon.ico时，直接返回此数据，无需读取文件
 char favicon[555] = {
     '\x89', 'P',    'N',    'G',    '\xD',  '\xA',  '\x1A', '\xA',  '\x0',
     '\x0',  '\x0',  '\xD',  'I',    'H',    'D',    'R',    '\x0',  '\x0',
@@ -84,6 +99,14 @@ char favicon[555] = {
     'N',    'D',    '\xAE', 'B',    '\x60', '\x82',
 };
 
+/**
+ * @brief 初始化MIME类型映射表
+ * 
+ * @details 建立文件扩展名到MIME类型的映射关系
+ * 支持常见的文件类型：HTML、CSS、JS、图片、视频、音频等
+ * 
+ * @note 此函数只执行一次（通过pthread_once保证）
+ */
 void MimeType::init() {
   mime[".html"] = "text/html";
   mime[".avi"] = "video/x-msvideo";
@@ -95,20 +118,42 @@ void MimeType::init() {
   mime[".htm"] = "text/html";
   mime[".ico"] = "image/x-icon";
   mime[".jpg"] = "image/jpeg";
+  mime[".css"] = "text/css";
+  mime[".js"] = "application/javascript";
   mime[".png"] = "image/png";
   mime[".txt"] = "text/plain";
   mime[".mp3"] = "audio/mp3";
-  mime["default"] = "text/html";
+  mime["default"] = "text/html";  ///< 默认MIME类型
 }
 
+/**
+ * @brief 根据文件扩展名获取MIME类型
+ * 
+ * @param suffix 文件扩展名（如".html"、".css"、".js"）
+ * @return std::string 对应的MIME类型字符串
+ * 
+ * @details 如果找不到对应的MIME类型，返回默认值"text/html"
+ * 使用pthread_once确保映射表只初始化一次
+ */
 std::string MimeType::getMime(const std::string &suffix) {
-  pthread_once(&once_control, MimeType::init);
+  pthread_once(&once_control, MimeType::init);  // 确保只初始化一次
   if (mime.find(suffix) == mime.end())
     return mime["default"];
   else
     return mime[suffix];
 }
 
+/**
+ * @brief HttpData构造函数，初始化HTTP连接处理对象
+ * 
+ * @param loop 所属的事件循环
+ * @param connfd 客户端连接的文件描述符
+ * 
+ * @details 初始化流程：
+ * 1. 创建Channel对象关联连接的文件描述符
+ * 2. 初始化所有成员变量（状态机、缓冲区等）
+ * 3. 绑定事件处理回调函数（读、写、连接）
+ */
 HttpData::HttpData(EventLoop *loop, int connfd)
     : loop_(loop),
       channel_(new Channel(loop, connfd)),
@@ -122,20 +167,28 @@ HttpData::HttpData(EventLoop *loop, int connfd)
       hState_(H_START),
       keepAlive_(false) {
   // loop_->queueInLoop(bind(&HttpData::setHandlers, this));
-  channel_->setReadHandler(bind(&HttpData::handleRead, this));
-  channel_->setWriteHandler(bind(&HttpData::handleWrite, this));
-  channel_->setConnHandler(bind(&HttpData::handleConn, this));
+  channel_->setReadHandler(bind(&HttpData::handleRead, this));   // 绑定读事件处理
+  channel_->setWriteHandler(bind(&HttpData::handleWrite, this)); // 绑定写事件处理
+  channel_->setConnHandler(bind(&HttpData::handleConn, this));   // 绑定连接事件处理
 }
 
+/**
+ * @brief 重置HTTP请求处理状态，用于处理下一个请求（Keep-Alive）
+ * 
+ * @details 清空文件名、路径、HTTP头等信息，重置状态机到初始状态
+ * 分离定时器，但保留连接状态和Keep-Alive标志
+ * 
+ * @note 用于HTTP长连接场景，同一个连接可以处理多个请求
+ */
 void HttpData::reset() {
-  // inBuffer_.clear();
+  // inBuffer_.clear();  // 不清空输入缓冲区，可能还有数据
   fileName_.clear();
   path_.clear();
   nowReadPos_ = 0;
-  state_ = STATE_PARSE_URI;
-  hState_ = H_START;
+  state_ = STATE_PARSE_URI;  // 重置状态机到URI解析阶段
+  hState_ = H_START;          // 重置HTTP头解析状态机
   headers_.clear();
-  // keepAlive_ = false;
+  // keepAlive_ = false;  // 保留Keep-Alive标志
   if (timer_.lock()) {
     shared_ptr<TimerNode> my_timer(timer_.lock());
     my_timer->clearReq();
@@ -143,6 +196,12 @@ void HttpData::reset() {
   }
 }
 
+/**
+ * @brief 分离定时器，取消该连接的定时器关联
+ * 
+ * @details 清除定时器与HttpData的关联，标记定时器为deleted
+ * 用于延迟删除策略，避免立即从优先队列中删除
+ */
 void HttpData::seperateTimer() {
   // cout << "seperateTimer" << endl;
   if (timer_.lock()) {
@@ -152,18 +211,36 @@ void HttpData::seperateTimer() {
   }
 }
 
+/**
+ * @brief 处理读事件，读取HTTP请求并解析
+ * 
+ * @details 这是HTTP请求处理的核心函数，使用状态机解析请求：
+ * 
+ * 处理流程：
+ * 1. 读取数据到inBuffer_（非阻塞，可能只读取部分数据）
+ * 2. 根据当前状态（state_）执行相应的解析步骤：
+ *    - STATE_PARSE_URI：解析请求行（方法、URI、版本）
+ *    - STATE_PARSE_HEADERS：解析HTTP头
+ *    - STATE_RECV_BODY：接收POST请求体
+ *    - STATE_ANALYSIS：分析请求并生成响应
+ * 3. 如果解析完成，调用handleWrite()发送响应
+ * 4. 如果处理完成且Keep-Alive，重置状态继续处理下一个请求
+ * 
+ * @note 使用do-while(false)结构，便于使用break跳出
+ * 边缘触发模式下，需要一次性处理完所有数据
+ */
 void HttpData::handleRead() {
   __uint32_t &events_ = channel_->getEvents();
   do {
-    bool zero = false;
-    int read_num = readn(fd_, inBuffer_, zero);
+    bool zero = false;  ///< 对端是否关闭连接
+    int read_num = readn(fd_, inBuffer_, zero);  // 读取数据（非阻塞）
     LOG << "Request: " << inBuffer_;
-    if (connectionState_ == H_DISCONNECTING) {
+    if (connectionState_ == H_DISCONNECTING) {  // 连接正在断开
       inBuffer_.clear();
       break;
     }
     // cout << inBuffer_ << endl;
-    if (read_num < 0) {
+    if (read_num < 0) {  // 读取错误
       perror("1");
       error_ = true;
       handleError(fd_, 400, "Bad Request");
@@ -174,7 +251,7 @@ void HttpData::handleRead() {
     //     error_ = true;
     //     break;
     // }
-    else if (zero) {
+    else if (zero) {  // 对端关闭连接
       // 有请求出现但是读不到数据，可能是Request
       // Aborted，或者来自网络的数据没有达到等原因
       // 最可能是对端已经关闭了，统一按照对端已经关闭处理
@@ -187,11 +264,12 @@ void HttpData::handleRead() {
       // cout << "readnum == 0" << endl;
     }
 
+    // 状态机：解析URI（请求行）
     if (state_ == STATE_PARSE_URI) {
       URIState flag = this->parseURI();
-      if (flag == PARSE_URI_AGAIN)
+      if (flag == PARSE_URI_AGAIN)  // 需要更多数据
         break;
-      else if (flag == PARSE_URI_ERROR) {
+      else if (flag == PARSE_URI_ERROR) {  // 解析错误
         perror("2");
         LOG << "FD = " << fd_ << "," << inBuffer_ << "******";
         inBuffer_.clear();
@@ -199,25 +277,30 @@ void HttpData::handleRead() {
         handleError(fd_, 400, "Bad Request");
         break;
       } else
-        state_ = STATE_PARSE_HEADERS;
+        state_ = STATE_PARSE_HEADERS;  // 解析成功，进入下一阶段
     }
+    
+    // 状态机：解析HTTP头
     if (state_ == STATE_PARSE_HEADERS) {
       HeaderState flag = this->parseHeaders();
-      if (flag == PARSE_HEADER_AGAIN)
+      if (flag == PARSE_HEADER_AGAIN)  // 需要更多数据
         break;
-      else if (flag == PARSE_HEADER_ERROR) {
+      else if (flag == PARSE_HEADER_ERROR) {  // 解析错误
         perror("3");
         error_ = true;
         handleError(fd_, 400, "Bad Request");
         break;
       }
       if (method_ == METHOD_POST) {
-        // POST方法准备
+        // POST方法需要接收请求体
         state_ = STATE_RECV_BODY;
       } else {
+        // GET/HEAD方法直接进入分析阶段
         state_ = STATE_ANALYSIS;
       }
     }
+    
+    // 状态机：接收POST请求体
     if (state_ == STATE_RECV_BODY) {
       int content_length = -1;
       if (headers_.find("Content-length") != headers_.end()) {
@@ -228,13 +311,16 @@ void HttpData::handleRead() {
         handleError(fd_, 400, "Bad Request: Lack of argument (Content-length)");
         break;
       }
+      // 检查是否已接收完所有请求体数据
       if (static_cast<int>(inBuffer_.size()) < content_length) break;
-      state_ = STATE_ANALYSIS;
+      state_ = STATE_ANALYSIS;  // 接收完成，进入分析阶段
     }
+    
+    // 状态机：分析请求并生成响应
     if (state_ == STATE_ANALYSIS) {
       AnalysisState flag = this->analysisRequest();
       if (flag == ANALYSIS_SUCCESS) {
-        state_ = STATE_FINISH;
+        state_ = STATE_FINISH;  // 分析成功，处理完成
         break;
       } else {
         // cout << "state_ == STATE_ANALYSIS" << endl;
@@ -244,15 +330,18 @@ void HttpData::handleRead() {
     }
   } while (false);
   // cout << "state_=" << state_ << endl;
+  
+  // 处理完成后的操作
   if (!error_) {
     if (outBuffer_.size() > 0) {
-      handleWrite();
+      handleWrite();  // 发送响应
       // events_ |= EPOLLOUT;
     }
     // error_ may change
     if (!error_ && state_ == STATE_FINISH) {
-      this->reset();
+      this->reset();  // 重置状态，准备处理下一个请求（Keep-Alive）
       if (inBuffer_.size() > 0) {
+        // 如果还有数据，继续处理（支持HTTP管线化）
         if (connectionState_ != H_DISCONNECTING) handleRead();
       }
 
@@ -263,75 +352,131 @@ void HttpData::handleRead() {
       //     events_ |= EPOLLIN;
       // }
     } else if (!error_ && connectionState_ != H_DISCONNECTED)
-      events_ |= EPOLLIN;
+      events_ |= EPOLLIN;  // 继续监听读事件
   }
 }
 
+/**
+ * @brief 处理写事件，发送HTTP响应数据
+ * 
+ * @details 将outBuffer_中的数据发送到客户端。
+ * 如果数据未完全发送（非阻塞模式下可能遇到EAGAIN），
+ * 继续监听EPOLLOUT事件，等待下次可写时继续发送。
+ * 
+ * @note 边缘触发模式下，需要一次性发送完所有数据
+ */
 void HttpData::handleWrite() {
   if (!error_ && connectionState_ != H_DISCONNECTED) {
     __uint32_t &events_ = channel_->getEvents();
-    if (writen(fd_, outBuffer_) < 0) {
+    if (writen(fd_, outBuffer_) < 0) {  // 写入数据（非阻塞）
       perror("writen");
       events_ = 0;
       error_ = true;
     }
+    // 如果还有数据未发送完，继续监听写事件
     if (outBuffer_.size() > 0) events_ |= EPOLLOUT;
   }
 }
 
+/**
+ * @brief 处理连接事件，更新epoll事件和定时器
+ * 
+ * @details 根据连接状态和Keep-Alive标志，更新epoll中的事件监听和超时时间：
+ * 
+ * 1. 如果连接正常且有事件：
+ *    - 如果同时有读和写事件，优先处理写事件
+ *    - 设置边缘触发模式
+ *    - 根据Keep-Alive设置超时时间
+ * 
+ * 2. 如果Keep-Alive：
+ *    - 继续监听读事件，等待下一个请求
+ *    - 设置较长的超时时间（5分钟）
+ * 
+ * 3. 如果非Keep-Alive：
+ *    - 继续监听读事件，但设置较短的超时时间
+ * 
+ * 4. 如果连接正在断开且有写事件：
+ *    - 只监听写事件，等待数据发送完成
+ * 
+ * 5. 其他情况：
+ *    - 关闭连接
+ */
 void HttpData::handleConn() {
-  seperateTimer();
+  seperateTimer();  // 分离定时器
   __uint32_t &events_ = channel_->getEvents();
   if (!error_ && connectionState_ == H_CONNECTED) {
     if (events_ != 0) {
-      int timeout = DEFAULT_EXPIRED_TIME;
-      if (keepAlive_) timeout = DEFAULT_KEEP_ALIVE_TIME;
+      int timeout = DEFAULT_EXPIRED_TIME;  // 默认超时时间（2秒）
+      if (keepAlive_) timeout = DEFAULT_KEEP_ALIVE_TIME;  // Keep-Alive超时时间（5分钟）
       if ((events_ & EPOLLIN) && (events_ & EPOLLOUT)) {
+        // 同时有读和写事件，优先处理写事件
         events_ = __uint32_t(0);
         events_ |= EPOLLOUT;
       }
       // events_ |= (EPOLLET | EPOLLONESHOT);
-      events_ |= EPOLLET;
+      events_ |= EPOLLET;  // 边缘触发模式
       loop_->updatePoller(channel_, timeout);
 
     } else if (keepAlive_) {
+      // Keep-Alive连接，继续监听读事件，等待下一个请求
       events_ |= (EPOLLIN | EPOLLET);
       // events_ |= (EPOLLIN | EPOLLET | EPOLLONESHOT);
       int timeout = DEFAULT_KEEP_ALIVE_TIME;
       loop_->updatePoller(channel_, timeout);
     } else {
+      // 非Keep-Alive连接，设置较短的超时时间
       // cout << "close normally" << endl;
       // loop_->shutdown(channel_);
       // loop_->runInLoop(bind(&HttpData::handleClose, shared_from_this()));
       events_ |= (EPOLLIN | EPOLLET);
       // events_ |= (EPOLLIN | EPOLLET | EPOLLONESHOT);
-      int timeout = (DEFAULT_KEEP_ALIVE_TIME >> 1);
+      int timeout = (DEFAULT_KEEP_ALIVE_TIME >> 1);  // 超时时间减半
       loop_->updatePoller(channel_, timeout);
     }
   } else if (!error_ && connectionState_ == H_DISCONNECTING &&
              (events_ & EPOLLOUT)) {
+    // 连接正在断开，但还有数据要发送，只监听写事件
     events_ = (EPOLLOUT | EPOLLET);
   } else {
+    // 其他情况，关闭连接
     // cout << "close with errors" << endl;
     loop_->runInLoop(bind(&HttpData::handleClose, shared_from_this()));
   }
 }
 
+/**
+ * @brief 解析HTTP请求URI（请求行）
+ * 
+ * @return URIState 解析结果状态
+ * 
+ * @details 解析HTTP请求的第一行，格式：METHOD URI HTTP/VERSION
+ * 例如：GET /index.html HTTP/1.1
+ * 
+ * 解析流程：
+ * 1. 查找请求行结束符（\r）
+ * 2. 提取HTTP方法（GET/POST/HEAD）
+ * 3. 提取URI（文件路径），去除查询参数（?后的部分）
+ * 4. 提取HTTP版本（1.0/1.1）
+ * 
+ * @note 如果URI为空或只有"/"，默认返回index.html
+ * 如果请求行不完整，返回PARSE_URI_AGAIN，等待更多数据
+ */
 URIState HttpData::parseURI() {
   string &str = inBuffer_;
   string cop = str;
-  // 读到完整的请求行再开始解析请求
+  // 读到完整的请求行再开始解析请求（请求行以\r\n结束）
   size_t pos = str.find('\r', nowReadPos_);
   if (pos < 0) {
-    return PARSE_URI_AGAIN;
+    return PARSE_URI_AGAIN;  // 请求行不完整，需要更多数据
   }
   // 去掉请求行所占的空间，节省空间
-  string request_line = str.substr(0, pos);
+  string request_line = str.substr(0, pos);  // 提取请求行
   if (str.size() > pos + 1)
-    str = str.substr(pos + 1);
+    str = str.substr(pos + 1);  // 移除已解析的请求行
   else
     str.clear();
-  // Method
+  
+  // 解析HTTP方法（GET/POST/HEAD）
   int posGet = request_line.find("GET");
   int posPost = request_line.find("POST");
   int posHead = request_line.find("HEAD");
@@ -349,67 +494,85 @@ URIState HttpData::parseURI() {
     return PARSE_URI_ERROR;
   }
 
-  // filename
-  pos = request_line.find("/", pos);
+  // 解析文件名（URI）
+  pos = request_line.find("/", pos);  // 查找URI开始位置
   if (pos < 0) {
+    // URI为空，默认返回index.html
     fileName_ = "index.html";
     HTTPVersion_ = HTTP_11;
     return PARSE_URI_SUCCESS;
   } else {
-    size_t _pos = request_line.find(' ', pos);
+    size_t _pos = request_line.find(' ', pos);  // 查找URI结束位置
     if (_pos < 0)
       return PARSE_URI_ERROR;
     else {
       if (_pos - pos > 1) {
-        fileName_ = request_line.substr(pos + 1, _pos - pos - 1);
-        size_t __pos = fileName_.find('?');
+        fileName_ = request_line.substr(pos + 1, _pos - pos - 1);  // 提取文件名
+        size_t __pos = fileName_.find('?');  // 查找查询参数开始位置
         if (__pos >= 0) {
+          // 去除查询参数（?后的部分）
           fileName_ = fileName_.substr(0, __pos);
         }
       }
-
       else
-        fileName_ = "index.html";
+        fileName_ = "index.html";  // URI只有"/"，默认index.html
     }
     pos = _pos;
   }
   // cout << "fileName_: " << fileName_ << endl;
-  // HTTP 版本号
-  pos = request_line.find("/", pos);
+  
+  // 解析HTTP版本号
+  pos = request_line.find("/", pos);  // 查找版本号开始位置（HTTP/1.1中的"/"）
   if (pos < 0)
     return PARSE_URI_ERROR;
   else {
     if (request_line.size() - pos <= 3)
       return PARSE_URI_ERROR;
     else {
-      string ver = request_line.substr(pos + 1, 3);
+      string ver = request_line.substr(pos + 1, 3);  // 提取版本号（如"1.1"）
       if (ver == "1.0")
         HTTPVersion_ = HTTP_10;
       else if (ver == "1.1")
         HTTPVersion_ = HTTP_11;
       else
-        return PARSE_URI_ERROR;
+        return PARSE_URI_ERROR;  // 不支持的版本
     }
   }
   return PARSE_URI_SUCCESS;
 }
 
+/**
+ * @brief 解析HTTP请求头
+ * 
+ * @return HeaderState 解析结果状态
+ * 
+ * @details 使用状态机逐字符解析HTTP头部，格式：Key: Value\r\n
+ * 
+ * 状态机流程：
+ * H_START → H_KEY → H_COLON → H_SPACES_AFTER_COLON → 
+ * H_VALUE → H_CR → H_LF → (下一个header或H_END_CR → H_END_LF)
+ * 
+ * 解析完每个header后，存储到headers_映射表中
+ * 遇到空行（\r\n\r\n）表示头部解析完成
+ * 
+ * @note 如果头部不完整，返回PARSE_HEADER_AGAIN，等待更多数据
+ */
 HeaderState HttpData::parseHeaders() {
   string &str = inBuffer_;
-  int key_start = -1, key_end = -1, value_start = -1, value_end = -1;
-  int now_read_line_begin = 0;
-  bool notFinish = true;
+  int key_start = -1, key_end = -1, value_start = -1, value_end = -1;  ///< header键值对的起止位置
+  int now_read_line_begin = 0;  ///< 当前行的开始位置
+  bool notFinish = true;        ///< 是否解析完成
   size_t i = 0;
   for (; i < str.size() && notFinish; ++i) {
     switch (hState_) {
-      case H_START: {
+      case H_START: {  ///< 开始状态，跳过空白字符
         if (str[i] == '\n' || str[i] == '\r') break;
         hState_ = H_KEY;
         key_start = i;
         now_read_line_begin = i;
         break;
       }
-      case H_KEY: {
+      case H_KEY: {  ///< 解析键（header name）
         if (str[i] == ':') {
           key_end = i;
           if (key_end - key_start <= 0) return PARSE_HEADER_ERROR;
@@ -418,30 +581,31 @@ HeaderState HttpData::parseHeaders() {
           return PARSE_HEADER_ERROR;
         break;
       }
-      case H_COLON: {
+      case H_COLON: {  ///< 遇到冒号
         if (str[i] == ' ') {
           hState_ = H_SPACES_AFTER_COLON;
         } else
           return PARSE_HEADER_ERROR;
         break;
       }
-      case H_SPACES_AFTER_COLON: {
+      case H_SPACES_AFTER_COLON: {  ///< 冒号后的空格
         hState_ = H_VALUE;
         value_start = i;
         break;
       }
-      case H_VALUE: {
+      case H_VALUE: {  ///< 解析值（header value）
         if (str[i] == '\r') {
           hState_ = H_CR;
           value_end = i;
           if (value_end - value_start <= 0) return PARSE_HEADER_ERROR;
-        } else if (i - value_start > 255)
+        } else if (i - value_start > 255)  // 值太长
           return PARSE_HEADER_ERROR;
         break;
       }
-      case H_CR: {
+      case H_CR: {  ///< 回车符
         if (str[i] == '\n') {
           hState_ = H_LF;
+          // 提取键值对并存储
           string key(str.begin() + key_start, str.begin() + key_end);
           string value(str.begin() + value_start, str.begin() + value_end);
           headers_[key] = value;
@@ -450,23 +614,23 @@ HeaderState HttpData::parseHeaders() {
           return PARSE_HEADER_ERROR;
         break;
       }
-      case H_LF: {
+      case H_LF: {  ///< 换行符
         if (str[i] == '\r') {
-          hState_ = H_END_CR;
+          hState_ = H_END_CR;  // 可能是头部结束（空行）
         } else {
-          key_start = i;
+          key_start = i;  // 下一个header开始
           hState_ = H_KEY;
         }
         break;
       }
-      case H_END_CR: {
+      case H_END_CR: {  ///< 头部结束的回车符
         if (str[i] == '\n') {
-          hState_ = H_END_LF;
+          hState_ = H_END_LF;  // 头部解析完成
         } else
           return PARSE_HEADER_ERROR;
         break;
       }
-      case H_END_LF: {
+      case H_END_LF: {  ///< 头部结束的换行符（空行）
         notFinish = false;
         key_start = i;
         now_read_line_begin = i;
@@ -475,18 +639,45 @@ HeaderState HttpData::parseHeaders() {
     }
   }
   if (hState_ == H_END_LF) {
-    str = str.substr(i);
+    str = str.substr(i);  // 移除已解析的头部
     return PARSE_HEADER_SUCCESS;
   }
-  str = str.substr(now_read_line_begin);
-  return PARSE_HEADER_AGAIN;
+  str = str.substr(now_read_line_begin);  // 保留未解析的部分
+  return PARSE_HEADER_AGAIN;  // 需要更多数据
 }
 
+/**
+ * @brief 分析HTTP请求并生成响应
+ * 
+ * @return AnalysisState 分析结果状态
+ * 
+ * @details 根据HTTP方法和请求的文件，生成相应的HTTP响应：
+ * 
+ * 1. POST方法：
+ *    - 当前未实现（有OpenCV图像拼接的注释代码）
+ * 
+ * 2. GET/HEAD方法：
+ *    - 检查Keep-Alive头，设置keepAlive_标志
+ *    - 根据文件扩展名确定MIME类型
+ *    - 特殊处理：
+ *      * "hello"：返回"Hello World"文本
+ *      * "favicon.ico"：返回内置的favicon数据
+ *    - 静态文件服务：
+ *      * 使用mmap将文件映射到内存
+ *      * 生成HTTP响应头（状态码、Content-Type、Content-Length等）
+ *      * 将文件内容添加到响应体
+ *    - 错误处理：
+ *      * 文件不存在：返回404错误
+ *      * 文件是目录：返回400错误
+ * 
+ * @note 使用mmap提高大文件传输性能
+ */
 AnalysisState HttpData::analysisRequest() {
   if (method_ == METHOD_POST) {
     // ------------------------------------------------------
     // My CV stitching handler which requires OpenCV library
     // ------------------------------------------------------
+    // POST方法处理（当前未实现，有OpenCV图像拼接的示例代码）
     // string header;
     // header += string("HTTP/1.1 200 OK\r\n");
     // if(headers_.find("Connection") != headers_.end() &&

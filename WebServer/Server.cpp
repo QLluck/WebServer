@@ -1,18 +1,35 @@
-// @Author Lin Ya
-// @Email xxbbb@vip.qq.com
-#include "Server.h"
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <functional>
-#include "Util.h"
-#include "base/Logging.h"
+/// @file Server.cpp
+/// @brief 服务器核心类实现文件
+/// @author Lin Ya
+/// @email xxbbb@vip.qq.com
+/// 
+/// @details 本文件实现了Server类的所有方法，包括：
+/// - 服务器初始化和启动
+/// - 新连接的处理和分配
+/// - 与事件循环的交互
 
-/// @brief Server类的构造函数，初始化服务器实例
-/// @param loop 主事件循环，负责处理监听socket的事件
-/// @param threadNum 事件循环线程池中的线程数量
-/// @param port 服务器监听的端口号
-/// @returns 无
+#include "Server.h"
+#include <arpa/inet.h>    ///< 提供网络地址转换函数（如inet_ntoa）
+#include <netinet/in.h>   ///< 提供网络地址结构体定义（如sockaddr_in）
+#include <sys/socket.h>   ///< 提供socket相关系统调用
+#include <functional>     ///< 提供函数对象和bind功能
+#include "Util.h"         ///< 工具函数（socket操作、IO操作等）
+#include "base/Logging.h" ///< 日志系统
+
+/**
+ * @brief Server类的构造函数，初始化服务器实例
+ * 
+ * @param loop 主事件循环，负责处理监听socket的事件
+ * @param threadNum 事件循环线程池中的线程数量
+ * @param port 服务器监听的端口号
+ * 
+ * @details 构造函数执行以下初始化工作：
+ * - 创建事件循环线程池
+ * - 创建监听socket并绑定到指定端口
+ * - 创建accept通道用于监听新连接
+ * - 设置socket为非阻塞模式
+ * - 处理SIGPIPE信号，避免客户端断开时服务器崩溃
+ */
 Server::Server(EventLoop *loop, int threadNum, int port)
     : loop_(loop), ///< 初始化主事件循环指针
       threadNum_(threadNum),  ///<初始化线程池数量
@@ -34,8 +51,19 @@ Server::Server(EventLoop *loop, int threadNum, int port)
   }
 }
 
-/// @brief 启动服务器，初始化事件循环线程池并配置监听通道，使服务器进入运行状态
-/// @note 该函数会完成服务器启动的核心流程：启动线程池、配置监听事件、绑定回调函数、将通道加入事件循环
+/**
+ * @brief 启动服务器，初始化事件循环线程池并配置监听通道
+ * 
+ * @details 启动流程：
+ * 1. 启动事件循环线程池，创建工作线程（SubReactor）
+ * 2. 配置accept通道监听EPOLLIN事件（边缘触发模式）
+ * 3. 绑定新连接处理回调函数（handNewConn）
+ * 4. 绑定连接管理回调函数（handThisConn）
+ * 5. 将accept通道加入主事件循环的epoll监控
+ * 6. 设置服务器启动状态为true
+ * 
+ * @note 调用此函数后，服务器开始监听并处理客户端连接
+ */
 void Server::start() {
   // 启动事件循环线程池，创建并初始化所有子事件循环线程
   // 线程池启动后可处理后续接收的客户端连接
@@ -64,10 +92,23 @@ void Server::start() {
   // 更新服务器启动状态为已启动
   started_ = true;
 }
-/// @brief 处理新客户端连接的核心函数，由acceptChannel_的读事件触发
-/// @note 当监听到新连接请求（EPOLLIN事件）时被调用，负责接收连接、初始化处理对象并分配到事件循环
+/**
+ * @brief 处理新客户端连接的核心函数，由acceptChannel_的读事件触发
+ * 
+ * @details 当监听socket触发EPOLLIN事件时被调用，执行以下操作：
+ * 1. 循环accept所有待处理的连接（ET模式需要一次性处理完）
+ * 2. 从线程池中获取一个事件循环（Round Robin负载均衡）
+ * 3. 记录客户端IP和端口信息
+ * 4. 检查连接数限制（MAXFDS）
+ * 5. 设置新socket为非阻塞模式
+ * 6. 禁用Nagle算法（减少延迟）
+ * 7. 创建HttpData对象处理该连接
+ * 8. 将初始化任务加入对应事件循环的队列
+ * 
+ * @note 使用边缘触发（ET）模式，必须循环accept直到返回EAGAIN
+ */
 void Server::handNewConn() {
-    // 定义用于存储客户端地址信息的结构体（IPv4）
+  // 定义用于存储客户端地址信息的结构体（IPv4）
   struct sockaddr_in client_addr;
   // 将 client_addr 结构体的所有字节初始化为 0
   // 作用：清除结构体中的垃圾值，确保内存状态可控
